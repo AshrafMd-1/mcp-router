@@ -61,6 +61,12 @@ function toRuntimeConnector(
 ): ConnectorDefinition {
   if (transport === 'http') {
     const url = typeof configJson.url === 'string' ? configJson.url : '';
+
+    // SDK-aligned: Extract custom headers from configJson.headers
+    const customHeaders = configJson.headers && typeof configJson.headers === 'object'
+      ? configJson.headers as Record<string, string>
+      : undefined;
+
     return {
       id,
       name,
@@ -70,6 +76,7 @@ function toRuntimeConnector(
         url,
         ...(authToken ? { authToken } : {}),
         ...(authToken ? { authScheme } : {}),
+        ...(customHeaders ? { customHeaders } : {}),
         ...(configJson.oauth && typeof configJson.oauth === 'object' ? { oauth: configJson.oauth as any } : {})
       }
     };
@@ -630,7 +637,7 @@ export async function registerAdminRoutes(app: FastifyInstance, ctx: AppContext)
     const policy = await ctx.services.clientPolicies.setForClient(clientId, {
       connectorIds: parsed.data.connectorIds,
       allowedTools: parsed.data.allowedTools,
-      deniedTools: []
+      deniedTools: parsed.data.deniedTools
     });
     return { policy };
   });

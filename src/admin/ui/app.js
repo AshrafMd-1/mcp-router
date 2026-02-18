@@ -84,7 +84,14 @@ modalWrap.addEventListener('click', (e) => {
 });
 
 function fmtDate(iso) {
+  if (!iso) return 'Never';
   return new Date(iso).toLocaleString();
+}
+
+function normalizeHealth(status) {
+  if (status === 'healthy') return { label: 'Healthy', className: 'ok' };
+  if (status === 'unhealthy' || status === 'degraded') return { label: 'Unhealthy', className: 'bad' };
+  return { label: 'Unknown', className: 'neutral' };
 }
 
 async function refreshClients() {
@@ -98,14 +105,35 @@ async function refreshConnectors() {
 }
 
 async function loadToolCounts() {
-  for (const c of state.connectors) {
-    try {
-      const catalog = await api(`/admin/tool-catalog?connectorId=${encodeURIComponent(c.id)}`);
-      c.toolCount = (catalog.tools || []).length;
-    } catch {
-      c.toolCount = 0;
-    }
-  }
+  await Promise.all(
+    state.connectors.map(async (c) => {
+      try {
+        const catalog = await api(`/admin/tool-catalog?connectorId=${encodeURIComponent(c.id)}`);
+        c.toolCount = (catalog.tools || []).length;
+      } catch {
+        c.toolCount = 0;
+      }
+    })
+  );
+}
+
+async function loadConnectorHealth() {
+  await Promise.all(
+    state.connectors.map(async (c) => {
+      try {
+        const health = await api(`/admin/connectors/${encodeURIComponent(c.id)}/health`);
+        c.healthStatus = health.status || 'unknown';
+        c.healthError = health.error || null;
+        if (typeof health.lastCheck === 'number' && Number.isFinite(health.lastCheck)) {
+          c.lastHealthAt = new Date(health.lastCheck).toISOString();
+        } else if (!c.lastHealthAt) {
+          c.lastHealthAt = null;
+        }
+      } catch {
+        c.healthStatus = c.healthStatus || 'unknown';
+      }
+    })
+  );
 }
 
 function render() {
@@ -117,10 +145,12 @@ function render() {
     cards.innerHTML = state.clients
       .map(
         (c) => `
-      <div class="card">
+      <div class="card ${c.enabled ? '' : 'disabled'}">
         <div class="card-title">${escapeHtml(c.name)}</div>
+        <div class="badge ${c.enabled ? 'ok' : 'neutral'}">${c.enabled ? 'Enabled' : 'Disabled'}</div>
         <div class="small">Created: ${escapeHtml(fmtDate(c.createdAt))}</div>
         <div class="link-row">
+          <button class="link-btn" data-act="toggle-client" data-id="${escapeHtml(c.id)}" data-enabled="${c.enabled ? '1' : '0'}">${c.enabled ? 'Disable' : 'Enable'}</button>
           <button class="link-btn" data-act="edit-client" data-id="${escapeHtml(c.id)}">Edit</button>
           <button class="link-btn" data-act="delete-client" data-id="${escapeHtml(c.id)}">Delete</button>
         </div>
@@ -134,13 +164,14 @@ function render() {
   createBtn.textContent = 'Create Connector';
   cards.innerHTML = state.connectors
     .map((c) => {
-      const healthy = c.healthStatus === 'healthy';
       const countTag = c.toolCount ?? 0;
+      const health = normalizeHealth(c.healthStatus);
       return `
       <div class="card">
         <div class="card-title">${escapeHtml(c.name)}</div>
         <div class="badge">Tools ${countTag}</div>
-        <div class="badge ${healthy ? 'ok' : 'bad'}">${healthy ? 'alive' : 'dead'}</div>
+        <div class="badge ${health.className}">${health.label}</div>
+        <div class="small">Last Checked: ${escapeHtml(fmtDate(c.lastHealthAt))}</div>
         <div class="link-row">
           <button class="link-btn" data-act="edit-connector" data-id="${escapeHtml(c.id)}">Edit</button>
           <button class="link-btn" data-act="discover-connector" data-id="${escapeHtml(c.id)}">Refresh Tools</button>
@@ -153,7 +184,7 @@ function render() {
 
 async function loadDashboard() {
   await Promise.all([refreshClients(), refreshConnectors()]);
-  await loadToolCounts();
+  await Promise.all([loadToolCounts(), loadConnectorHealth()]);
   render();
 }
 
@@ -178,6 +209,7 @@ async function clientModal(clientId = null) {
   let activeTab = 'details';
   let selectedConnectorIds = new Set();
   let allowedTools = new Set();
+  let deniedTools = new Set();
   const toolCatalogByConnector = new Map();
   const sortedConnectors = [...state.connectors].sort((a, b) => a.name.localeCompare(b.name));
   let activeConnectorId = sortedConnectors[0]?.id ?? null;
@@ -227,6 +259,13 @@ async function clientModal(clientId = null) {
       .sort((a, b) => getToolShortName(a, connector).localeCompare(getToolShortName(b, connector)));
   };
 
+  const listDeniedToolsForConnector = (connector) => {
+    const prefix = `${connector.name}.`;
+    return [...deniedTools]
+      .filter((toolName) => toolName.startsWith(prefix))
+      .sort((a, b) => getToolShortName(a, connector).localeCompare(getToolShortName(b, connector)));
+  };
+
   const ensureCatalogLoaded = async (connectorId) => {
     if (!connectorId || toolCatalogByConnector.has(connectorId)) return;
     const tools = await fetchToolCatalogForConnector(connectorId);
@@ -235,9 +274,10 @@ async function clientModal(clientId = null) {
 
   if (effectiveClientId) {
     const policyResponse = await api(`/admin/clients/${effectiveClientId}/policy`);
-    const policy = policyResponse.policy || { connectorIds: [], allowedTools: [] };
+    const policy = policyResponse.policy || { connectorIds: [], allowedTools: [], deniedTools: [] };
     selectedConnectorIds = new Set(policy.connectorIds || []);
     allowedTools = new Set(policy.allowedTools || []);
+    deniedTools = new Set(policy.deniedTools || []);
     activeConnectorId = (policy.connectorIds || []).find((id) => getConnectorById(id)) || activeConnectorId;
 
     for (const connectorId of selectedConnectorIds) {
@@ -276,7 +316,10 @@ async function clientModal(clientId = null) {
       .map((toolName) => {
         const connector = getConnectorById(activeConnectorId);
         const label = getToolShortName(toolName, connector);
-        return `<button class="chip ${allowedTools.has(toolName) ? 'allow' : ''}" data-tool="${escapeHtml(toolName)}">${escapeHtml(label)}</button>`;
+        const isAllowed = allowedTools.has(toolName);
+        const isDenied = deniedTools.has(toolName);
+        const chipClass = isDenied ? 'deny' : isAllowed ? 'allow' : '';
+        return `<button class="chip ${chipClass}" data-tool="${escapeHtml(toolName)}" title="Click=allow, Right-click=deny">${escapeHtml(label)}</button>`;
       })
       .join('');
 
@@ -292,11 +335,23 @@ async function clientModal(clientId = null) {
       .filter(Boolean)
       .join('');
 
+    const deniedToolGroups = sortedConnectors
+      .map((connector) => {
+        const names = listDeniedToolsForConnector(connector);
+        if (names.length === 0) return '';
+        const chips = names
+          .map((toolName) => `<button class="chip deny" data-denied-tool="${escapeHtml(toolName)}">${escapeHtml(getToolShortName(toolName, connector))}</button>`)
+          .join('');
+        return `<div><div class="small" style="margin-bottom:6px;">${escapeHtml(connector.name)}</div><div class="chips">${chips}</div></div>`;
+      })
+      .filter(Boolean)
+      .join('');
+
     const policyJson = JSON.stringify(
       {
         connectorIds: [...selectedConnectorIds].sort(),
         allowedTools: [...allowedTools].sort(),
-        deniedTools: []
+        deniedTools: [...deniedTools].sort()
       },
       null,
       2
@@ -307,7 +362,10 @@ async function clientModal(clientId = null) {
         (t) => `
       <div class="token-row">
         <div><strong>${escapeHtml(t.tokenPrefix)}</strong> <span class="small">${escapeHtml(fmtDate(t.createdAt))}</span>${t.revokedAt ? ' <span class="small">(revoked)</span>' : ''}</div>
-        <button class="secondary" data-revoke-token="${escapeHtml(t.id)}" ${t.revokedAt ? 'disabled' : ''}>Revoke</button>
+        <div class="token-actions">
+          <button class="secondary" data-rotate-token="${escapeHtml(t.id)}" ${t.revokedAt ? 'disabled' : ''}>Rotate</button>
+          <button class="secondary" data-revoke-token="${escapeHtml(t.id)}" ${t.revokedAt ? 'disabled' : ''}>Revoke</button>
+        </div>
       </div>`
       )
       .join('');
@@ -354,6 +412,8 @@ async function clientModal(clientId = null) {
         <div class="chips">${toolChips || '<div class="small">No tools found for this connector.</div>'}</div>
         <label class="label">Selected Tools</label>
         <div>${selectedToolGroups || '<div class="small">No tools selected yet.</div>'}</div>
+        <label class="label">Denied Tools</label>
+        <div>${deniedToolGroups || '<div class="small">No tools denied yet.</div>'}</div>
         <label class="label">Policy JSON</label>
         <div class="json-panel">${escapeHtml(policyJson)}</div>
       </div>
@@ -409,13 +469,33 @@ async function clientModal(clientId = null) {
     });
 
     document.querySelectorAll('[data-tool]').forEach((btn) => {
-      btn.onclick = async () => {
+      btn.onclick = async (e) => {
+        e.preventDefault();
         const name = btn.getAttribute('data-tool');
         if (!name) return;
-        if (allowedTools.has(name)) {
+        // Cycle: none -> allow -> deny -> none
+        if (deniedTools.has(name)) {
+          deniedTools.delete(name);
+        } else if (allowedTools.has(name)) {
           allowedTools.delete(name);
+          deniedTools.add(name);
         } else {
           allowedTools.add(name);
+        }
+        recomputeSelectedConnectorsFromAllowedTools();
+        hasUnsavedChanges = true;
+        await renderModal();
+      };
+      btn.oncontextmenu = async (e) => {
+        e.preventDefault();
+        const name = btn.getAttribute('data-tool');
+        if (!name) return;
+        // Right-click directly toggles deny
+        if (deniedTools.has(name)) {
+          deniedTools.delete(name);
+        } else {
+          allowedTools.delete(name);
+          deniedTools.add(name);
         }
         recomputeSelectedConnectorsFromAllowedTools();
         hasUnsavedChanges = true;
@@ -431,6 +511,36 @@ async function clientModal(clientId = null) {
         recomputeSelectedConnectorsFromAllowedTools();
         hasUnsavedChanges = true;
         await renderModal();
+      };
+    });
+
+    document.querySelectorAll('[data-denied-tool]').forEach((btn) => {
+      btn.onclick = async () => {
+        const name = btn.getAttribute('data-denied-tool');
+        if (!name) return;
+        deniedTools.delete(name);
+        hasUnsavedChanges = true;
+        await renderModal();
+      };
+    });
+
+    document.querySelectorAll('[data-rotate-token]').forEach((btn) => {
+      btn.onclick = async () => {
+        if (!effectiveClientId) return;
+        const tokenId = btn.getAttribute('data-rotate-token');
+        if (!tokenId) return;
+        try {
+          const newToken = await api(`/admin/tokens/${tokenId}/rotate`, { method: 'POST', body: '{}' });
+          lastIssuedToken = newToken.token || null;
+          tokens = (await api(`/admin/clients/${effectiveClientId}/tokens`)).tokens || [];
+          await renderModal();
+          const output = document.getElementById('tokenIssueOutput');
+          if (output) {
+            output.innerHTML = `<div class="notice"><strong>Rotated Token (shown once)</strong><pre>${escapeHtml(JSON.stringify(newToken, null, 2))}</pre></div>`;
+          }
+        } catch (err) {
+          document.getElementById('clientNotice').textContent = err.message;
+        }
       };
     });
 
@@ -491,7 +601,7 @@ async function clientModal(clientId = null) {
 
         await api(`/admin/clients/${effectiveClientId}/policy`, {
           method: 'PUT',
-          body: JSON.stringify({ connectorIds: [...selectedConnectorIds].sort(), allowedTools: [...allowedTools].sort(), deniedTools: [] })
+          body: JSON.stringify({ connectorIds: [...selectedConnectorIds].sort(), allowedTools: [...allowedTools].sort(), deniedTools: [...deniedTools].sort() })
         });
         tokens = (await api(`/admin/clients/${effectiveClientId}/tokens`)).tokens || [];
         hasUnsavedChanges = false;
@@ -586,7 +696,7 @@ function connectorModal(connector) {
         const token = apiTokenEl.value;
         configJson = {
           url,
-          ...(token ? { Authorization: `Bearer ${token}` } : {})
+          ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {})
         };
       }
     } else {
@@ -696,6 +806,13 @@ cards.addEventListener('click', async (e) => {
   try {
     if (act === 'edit-client') {
       await clientModal(id);
+    } else if (act === 'toggle-client') {
+      const currentEnabled = btn.dataset.enabled === '1';
+      await api(`/admin/clients/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ enabled: !currentEnabled })
+      });
+      await loadDashboard();
     } else if (act === 'delete-client') {
       await api(`/admin/clients/${id}`, { method: 'DELETE' });
       await loadDashboard();

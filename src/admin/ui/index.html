@@ -31,11 +31,13 @@
       .primary { border: 0; background: var(--accent); color: #fff; border-radius: 10px; padding: 10px 14px; cursor: pointer; }
       .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
       .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+      .card.disabled { opacity: 0.65; filter: grayscale(0.25); }
       .card-title { font-weight: 700; margin-bottom: 8px; }
       .small { color: var(--muted); font-size: 13px; }
       .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 12px; margin-right: 6px; background: var(--chip); }
       .badge.ok { color: var(--ok); }
       .badge.bad { color: var(--danger); }
+      .badge.neutral { color: var(--muted); }
       .link-row { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
       .link-btn { border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
 
@@ -54,12 +56,17 @@
       .chip { border: 1px solid var(--line); padding: 6px 10px; border-radius: 999px; cursor: pointer; background: #fff; font-size: 13px; }
       .chip.focus { border-color: var(--accent); color: var(--accent); background: #eef5ff; }
       .chip.allow { border-color: var(--ok); color: var(--ok); background: #edf9f3; }
+      .chip.deny { border-color: var(--danger); color: var(--danger); background: #fff1f4; }
       .json-panel { border: 1px solid var(--line); border-radius: 10px; background: #0f172a; color: #e2e8f0; padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; }
       .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
       .tab-btn { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 10px; padding: 8px 12px; cursor: pointer; }
       .tab-btn.active { border-color: var(--accent); color: var(--accent); }
       .token-list { display: grid; gap: 8px; }
       .token-row { border: 1px solid var(--line); border-radius: 10px; background: #fff; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .token-actions { display: flex; gap: 6px; }
+      .header-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+      .inline-action { border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
+      .muted-note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
 
       .notice { border: 1px solid var(--line); background: #fff; border-radius: 10px; padding: 10px; margin-bottom: 10px; }
       details { margin-top: 6px; }

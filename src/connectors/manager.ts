@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ConnectorAdapter, ConnectorCapabilities } from './adapter.js';
 import { HttpConnectorAdapter } from './http-adapter.js';
 import { StdioConnectorAdapter } from './stdio-adapter.js';
+import { tryDiscoverOAuth, type OAuthServerInfo } from './oauth-discovery.js';
 import type { ToolDefinition } from '../mcp/protocol.js';
 
 export type ConnectorDefinition =
@@ -13,6 +14,7 @@ export type ConnectorDefinition =
         url: string;
         authToken?: string;
         authScheme?: string;
+        customHeaders?: Record<string, string>;
         oauth?: {
           authorizationUrl?: string;
           tokenUrl?: string;
@@ -36,6 +38,7 @@ interface ConnectorState {
   definition: ConnectorDefinition;
   adapter: ConnectorAdapter;
   capabilities: ConnectorCapabilities;
+  oauthDiscovery?: OAuthServerInfo;
 }
 
 export class ConnectorManager {
@@ -44,8 +47,15 @@ export class ConnectorManager {
   async register(definition: Omit<ConnectorDefinition, 'id'> & { id?: string }): Promise<ConnectorDefinition> {
     const connector: ConnectorDefinition = { ...definition, id: definition.id ?? randomUUID() } as ConnectorDefinition;
     const adapter = this.makeAdapter(connector);
+
+    // Attempt OAuth discovery for HTTP connectors (non-blocking)
+    let oauthDiscovery: OAuthServerInfo | undefined;
+    if (connector.type === 'http') {
+      oauthDiscovery = (await tryDiscoverOAuth(connector.config.url)) ?? undefined;
+    }
+
     const capabilities = await this.initializeConnector(connector, adapter);
-    this.states.set(connector.name, { definition: connector, adapter, capabilities });
+    this.states.set(connector.name, { definition: connector, adapter, capabilities, oauthDiscovery });
     return connector;
   }
 
@@ -55,6 +65,14 @@ export class ConnectorManager {
 
   get(name: string): ConnectorState | null {
     return this.states.get(name) ?? null;
+  }
+
+  /**
+   * Get OAuth discovery info for a connector
+   */
+  getOAuthDiscovery(name: string): OAuthServerInfo | null {
+    const state = this.states.get(name);
+    return state?.oauthDiscovery ?? null;
   }
 
   async updateHttpAuthToken(name: string, authToken: string, authScheme = 'Bearer'): Promise<ConnectorDefinition | null> {
@@ -68,6 +86,32 @@ export class ConnectorManager {
         ...state.definition.config,
         authToken,
         authScheme
+      }
+    };
+
+    await state.adapter.shutdown();
+    const adapter = this.makeAdapter(state.definition);
+    const capabilities = await adapter.initialize();
+    state.adapter = adapter;
+    state.capabilities = capabilities;
+
+    this.states.set(name, state);
+    return state.definition;
+  }
+
+  /**
+   * Update custom headers for an HTTP connector
+   */
+  async updateCustomHeaders(name: string, customHeaders: Record<string, string>): Promise<ConnectorDefinition | null> {
+    const state = this.states.get(name);
+    if (!state) return null;
+    if (state.definition.type !== 'http') return null;
+
+    state.definition = {
+      ...state.definition,
+      config: {
+        ...state.definition.config,
+        customHeaders
       }
     };
 
@@ -97,6 +141,21 @@ export class ConnectorManager {
     return capabilities;
   }
 
+  /**
+   * Re-run OAuth discovery for a connector (e.g., after receiving 401 with resource_metadata)
+   */
+  async refreshOAuthDiscovery(name: string, resourceMetadataUrl?: string): Promise<OAuthServerInfo | null> {
+    const state = this.states.get(name);
+    if (!state) return null;
+    if (state.definition.type !== 'http') return null;
+
+    const discovery = await tryDiscoverOAuth(state.definition.config.url);
+    if (discovery) {
+      state.oauthDiscovery = discovery;
+    }
+    return discovery;
+  }
+
   allTools(): ToolDefinition[] {
     const tools: ToolDefinition[] = [];
     for (const state of this.states.values()) {
@@ -114,7 +173,8 @@ export class ConnectorManager {
         name: definition.name,
         url: definition.config.url,
         authToken: definition.config.authToken,
-        authScheme: definition.config.authScheme
+        authScheme: definition.config.authScheme,
+        customHeaders: definition.config.customHeaders
       });
     }
 

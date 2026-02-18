@@ -1,12 +1,16 @@
 import type { ConnectorAdapter, ConnectorCapabilities, HealthStatus } from './adapter.js';
 import type { JsonRpcResponse, ToolDefinition, ToolResult } from '../mcp/protocol.js';
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from './protocol-constants.js';
+import { extractWWWAuthenticateParams, type ConnectorAuthState } from './auth-provider.js';
+import { McpError, ErrorCode } from '../mcp/error-mapper.js';
 
-interface HttpAdapterConfig {
+export interface HttpAdapterConfig {
   id: string;
   name: string;
   url: string;
   authToken?: string;
   authScheme?: string;
+  customHeaders?: Record<string, string>;
 }
 
 export class HttpConnectorAdapter implements ConnectorAdapter {
@@ -16,6 +20,11 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
 
   private readonly config: HttpAdapterConfig;
   private sessionId: string | null = null;
+  private protocolVersion: string = LATEST_PROTOCOL_VERSION;
+  private serverInfo: { name: string; version?: string } = { name: 'unknown' };
+  private authState: ConnectorAuthState = { status: 'none' };
+  private hasCompletedAuthFlow = false;
+
   private capabilities: ConnectorCapabilities = {
     tools: [],
     resources: [],
@@ -29,14 +38,85 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
     this.config = config;
   }
 
+  /**
+   * Set negotiated protocol version (called after initialize)
+   */
+  setProtocolVersion(version: string): void {
+    this.protocolVersion = version;
+  }
+
+  /**
+   * Initialize connection to upstream MCP server with retry logic
+   *
+   * Follows SDK pattern from typescript-sdk/packages/client/src/client.ts:419-471
+   */
   async initialize(): Promise<ConnectorCapabilities> {
-    await this.sendRequest('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: { tools: {}, resources: {}, prompts: {} },
-      clientInfo: { name: 'mcp-gateway', version: '0.1.0' }
-    });
-    await this.sendNotification('notifications/initialized');
-    return this.refreshCapabilities();
+    const maxRetries = 3;
+    const baseDelay = 1000;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        // Step 1: Send initialize request
+        const initResult = await this.sendRequest('initialize', {
+          protocolVersion: LATEST_PROTOCOL_VERSION,
+          capabilities: {
+            tools: {},
+            resources: {},
+            prompts: {},
+          },
+          clientInfo: {
+            name: 'mcp-gateway',
+            version: '1.0.0'
+          }
+        }) as {
+          protocolVersion: string;
+          capabilities: Record<string, unknown>;
+          serverInfo: { name: string; version?: string };
+        };
+
+        // Step 2: Validate protocol version
+        if (!initResult?.protocolVersion) {
+          throw new Error('Server sent invalid initialize result: missing protocolVersion');
+        }
+
+        if (!SUPPORTED_PROTOCOL_VERSIONS.includes(initResult.protocolVersion as typeof SUPPORTED_PROTOCOL_VERSIONS[number])) {
+          throw new Error(
+            `Server's protocol version ${initResult.protocolVersion} is not supported. ` +
+            `Supported: ${SUPPORTED_PROTOCOL_VERSIONS.join(', ')}`
+          );
+        }
+
+        // Step 3: Set negotiated version for subsequent requests
+        this.setProtocolVersion(initResult.protocolVersion);
+
+        // Store server info
+        this.serverInfo = initResult.serverInfo ?? { name: this.name };
+
+        // Step 4: Send initialized notification
+        await this.sendNotification('notifications/initialized');
+
+        // Step 5: Fetch tools/resources/prompts
+        return await this.refreshCapabilities();
+
+      } catch (error) {
+        const isLastAttempt = attempt === maxRetries - 1;
+
+        // Don't retry auth errors
+        if (error instanceof McpError && error.code === ErrorCode.Unauthorized) {
+          throw error;
+        }
+
+        if (isLastAttempt) {
+          throw error;
+        }
+
+        // Exponential backoff: 1s, 2s, 4s
+        const delay = baseDelay * Math.pow(2, attempt);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    throw new Error('Initialize failed after max retries');
   }
 
   async refreshCapabilities(): Promise<ConnectorCapabilities> {
@@ -48,7 +128,7 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
       tools: ((tools as { tools?: ToolDefinition[] }).tools ?? []).map((tool) => ({ ...tool })),
       resources: (resources as { resources?: Array<{ name: string; uri: string }> }).resources ?? [],
       prompts: (prompts as { prompts?: Array<{ name: string }> }).prompts ?? [],
-      serverInfo: { name: this.name }
+      serverInfo: this.serverInfo
     };
 
     return this.capabilities;
@@ -84,16 +164,23 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
 
   async shutdown(): Promise<void> {
     this.sessionId = null;
+    this.hasCompletedAuthFlow = false;
+    this.authState = { status: 'none' };
   }
 
   private async sendNotification(method: string, params?: unknown): Promise<void> {
     await fetch(this.config.url, {
       method: 'POST',
-      headers: this.headers(),
+      headers: this._commonHeaders(),
       body: JSON.stringify({ jsonrpc: '2.0', method, params })
     });
   }
 
+  /**
+   * Send JSON-RPC request with proper 401 handling
+   *
+   * Follows SDK pattern from typescript-sdk/packages/client/src/streamableHttp.ts:493-523
+   */
   private async sendRequest(method: string, params: unknown, timeout = 30000): Promise<unknown> {
     const id = Math.floor(Math.random() * 1000000);
     const controller = new AbortController();
@@ -102,21 +189,61 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
     try {
       const response = await fetch(this.config.url, {
         method: 'POST',
-        headers: this.headers(),
+        headers: this._commonHeaders(),
         body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
         signal: controller.signal
       });
 
-      if (!response.ok) {
-        const responseText = await response.text().catch(() => '');
-        const detail = responseText ? ` - ${responseText.slice(0, 300)}` : '';
-        throw new Error(`Downstream HTTP ${response.status}${detail}`);
+      // Handle 401 Unauthorized - trigger OAuth flow
+      if (response.status === 401) {
+        // Prevent infinite auth loops
+        if (this.hasCompletedAuthFlow) {
+          throw new McpError(
+            ErrorCode.Unauthorized,
+            'Server returned 401 after successful authentication',
+            { authRequired: true, connectorId: this.id }
+          );
+        }
+
+        // Extract OAuth hints from WWW-Authenticate header
+        const { resourceMetadataUrl, scope, error: authError } = extractWWWAuthenticateParams(response);
+
+        this.authState = {
+          status: 'pending',
+          resourceMetadataUrl: resourceMetadataUrl?.toString(),
+          scope,
+          error: authError,
+        };
+
+        // Return structured error with auth_required flag
+        throw new McpError(
+          ErrorCode.Unauthorized,
+          'Authentication required for upstream MCP server',
+          {
+            authRequired: true,
+            connectorId: this.id,
+            resourceMetadataUrl: resourceMetadataUrl?.toString(),
+            scope,
+          }
+        );
       }
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new McpError(
+          ErrorCode.Unavailable,
+          `Upstream HTTP ${response.status}: ${text.slice(0, 300)}`
+        );
+      }
+
+      // Reset auth loop detection on success
+      this.hasCompletedAuthFlow = false;
 
       const contentType = response.headers.get('content-type') ?? '';
       const payload = contentType.includes('text/event-stream')
         ? await this.consumeSseResponse(response, id)
         : ((await response.json()) as JsonRpcResponse<unknown>);
+
       if ('error' in payload) {
         throw new Error(payload.error.message);
       }
@@ -192,13 +319,42 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
     throw new Error('SSE response did not include matching JSON-RPC result');
   }
 
-  private headers(): Record<string, string> {
-    return {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-      'MCP-Protocol-Version': '2025-06-18',
-      ...(this.sessionId ? { 'Mcp-Session-Id': this.sessionId } : {}),
-      ...(this.config.authToken ? { Authorization: `${this.config.authScheme ?? 'Bearer'} ${this.config.authToken}` } : {})
-    };
+  /**
+   * Build common headers for all requests
+   *
+   * Follows SDK pattern from typescript-sdk/packages/client/src/streamableHttp.ts:186-208
+   */
+  private _commonHeaders(): HeadersInit {
+    const headers: Record<string, string> = {};
+
+    // Content negotiation
+    headers['content-type'] = 'application/json';
+    headers['accept'] = 'application/json, text/event-stream';
+
+    // Protocol version (use negotiated, not hardcoded)
+    headers['mcp-protocol-version'] = this.protocolVersion;
+
+    // Session ID if established
+    if (this.sessionId) {
+      headers['mcp-session-id'] = this.sessionId;
+    }
+
+    // Auth token (API key or OAuth access token)
+    if (this.config.authToken) {
+      headers['authorization'] = `${this.config.authScheme ?? 'Bearer'} ${this.config.authToken}`;
+    }
+
+    // Custom headers from connector config (without overwriting core headers)
+    if (this.config.customHeaders) {
+      for (const [key, value] of Object.entries(this.config.customHeaders)) {
+        const lowerKey = key.toLowerCase();
+        // Don't overwrite authorization or protocol headers
+        if (lowerKey !== 'authorization' && !lowerKey.startsWith('mcp-')) {
+          headers[key] = value;
+        }
+      }
+    }
+
+    return headers;
   }
 }

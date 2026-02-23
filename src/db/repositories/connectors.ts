@@ -52,9 +52,17 @@ export class ConnectorsRepository {
     enabled: boolean;
     configJson: Record<string, unknown>;
   }): Promise<ConnectorEntity> {
+    // Upsert on name: if the connector already exists (e.g. a previous Save attempt
+    // failed after the DB row was written), update its fields instead of erroring.
     const rows = await this.db.query<Row>(
       `INSERT INTO connectors (name, mode, transport, enabled, config_json)
        VALUES ($1, $2, $3, $4, $5::jsonb)
+       ON CONFLICT (name) DO UPDATE SET
+         mode        = EXCLUDED.mode,
+         transport   = EXCLUDED.transport,
+         enabled     = EXCLUDED.enabled,
+         config_json = EXCLUDED.config_json,
+         updated_at  = NOW()
        RETURNING id, name, mode, transport, enabled, config_json, health_status, health_error, last_health_at, created_at`,
       [input.name, input.mode, input.transport, input.enabled, JSON.stringify(input.configJson)]
     );

@@ -90,8 +90,18 @@ function fmtDate(iso) {
 
 function normalizeHealth(status) {
   if (status === 'healthy') return { label: 'Healthy', className: 'ok' };
+  if (status === 'auth_failed') return { label: 'Auth Expired', className: 'bad' };
   if (status === 'unhealthy' || status === 'degraded') return { label: 'Unhealthy', className: 'bad' };
   return { label: 'Unknown', className: 'neutral' };
+}
+
+async function startOAuth(connectorId) {
+  try {
+    const oauthStart = await api(`/admin/connectors/${encodeURIComponent(connectorId)}/oauth/start`, { method: 'POST', body: '{}' });
+    window.open(oauthStart.url, '_blank');
+  } catch (err) {
+    setError(err.message, err.details);
+  }
 }
 
 async function refreshClients() {
@@ -166,12 +176,19 @@ function render() {
     .map((c) => {
       const countTag = c.toolCount ?? 0;
       const health = normalizeHealth(c.healthStatus);
+      const authFailedBanner = c.healthStatus === 'auth_failed'
+        ? `<div class="notice" style="margin-top:8px;">
+             ⚠ Token expired.
+             <button class="btn-sm" onclick="startOAuth('${escapeHtml(c.id)}')">Re-authenticate</button>
+           </div>`
+        : '';
       return `
       <div class="card">
         <div class="card-title">${escapeHtml(c.name)}</div>
         <div class="badge">Tools ${countTag}</div>
         <div class="badge ${health.className}">${health.label}</div>
         <div class="small">Last Checked: ${escapeHtml(fmtDate(c.lastHealthAt))}</div>
+        ${authFailedBanner}
         <div class="link-row">
           <button class="link-btn" data-act="edit-connector" data-id="${escapeHtml(c.id)}">Edit</button>
           <button class="link-btn" data-act="discover-connector" data-id="${escapeHtml(c.id)}">Refresh Tools</button>

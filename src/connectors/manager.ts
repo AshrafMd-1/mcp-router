@@ -4,6 +4,8 @@ import { HttpConnectorAdapter } from './http-adapter.js';
 import { StdioConnectorAdapter } from './stdio-adapter.js';
 import { tryDiscoverOAuth, type OAuthServerInfo } from './oauth-discovery.js';
 import type { ToolDefinition } from '../mcp/protocol.js';
+import type { ConnectorCredentialsRepository } from '../db/repositories/connector-credentials.js';
+import type { ConnectorsRepository } from '../db/repositories/connectors.js';
 
 export type ConnectorDefinition =
   | {
@@ -43,6 +45,17 @@ interface ConnectorState {
 
 export class ConnectorManager {
   private readonly states = new Map<string, ConnectorState>();
+  private readonly services?: {
+    connectorCredentials: ConnectorCredentialsRepository;
+    connectorRepo: ConnectorsRepository;
+  };
+
+  constructor(services?: {
+    connectorCredentials: ConnectorCredentialsRepository;
+    connectorRepo: ConnectorsRepository;
+  }) {
+    this.services = services;
+  }
 
   async register(definition: Omit<ConnectorDefinition, 'id'> & { id?: string }): Promise<ConnectorDefinition> {
     const connector: ConnectorDefinition = { ...definition, id: definition.id ?? randomUUID() } as ConnectorDefinition;
@@ -166,15 +179,109 @@ export class ConnectorManager {
     return tools;
   }
 
+  private _makeTokenRefresher(
+    connectorId: string,
+    connectorUrl: string,
+    connectorName: string
+  ): (id: string) => Promise<string | null> {
+    const { services } = this;
+    if (!services) return async () => null;
+
+    return async (_id: string) => {
+      // 1. Load stored OAuth tokens
+      const cred = await services.connectorCredentials.get(connectorId, 'oauth_tokens');
+      const payload = cred?.payload;
+      const refreshToken = typeof payload?.refreshToken === 'string' ? payload.refreshToken : null;
+      if (!refreshToken) return null;
+
+      // 2. Get client credentials (config_json.oauth first, then stored payload)
+      const state = this.states.get(connectorName);
+      const oauthCfg = state?.definition.type === 'http' ? state.definition.config.oauth : undefined;
+      const clientId = oauthCfg?.clientId ?? (typeof payload?.clientId === 'string' ? payload.clientId : undefined);
+      const clientSecret = oauthCfg?.clientSecret ?? (typeof payload?.clientSecret === 'string' ? payload.clientSecret : undefined);
+      if (!clientId) return null;
+
+      // 3. Discover token endpoint via RFC 9728
+      let tokenEndpoint: string;
+      try {
+        const discovery = await tryDiscoverOAuth(connectorUrl);
+        const endpoint = discovery?.authorizationServerMetadata?.token_endpoint;
+        if (!endpoint) return null;
+        tokenEndpoint = endpoint;
+      } catch {
+        return null;
+      }
+
+      // 4. POST refresh_token grant
+      try {
+        const form = new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: clientId,
+        });
+        if (clientSecret) form.set('client_secret', clientSecret);
+
+        const res = await fetch(tokenEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: form.toString(),
+        });
+
+        if (!res.ok) {
+          await services.connectorRepo.setHealth(connectorId, 'auth_failed', 'Refresh token expired — re-authenticate via admin');
+          return null;
+        }
+
+        const data = (await res.json()) as {
+          access_token?: string;
+          refresh_token?: string;
+          expires_in?: number;
+          token_type?: string;
+        };
+        if (!data.access_token) return null;
+
+        // 5. Persist new tokens (rotate refresh_token if server issued a new one)
+        const expiresAt = data.expires_in
+          ? new Date(Date.now() + data.expires_in * 1000).toISOString()
+          : cred?.expiresAt ?? null;
+
+        await services.connectorCredentials.upsert(
+          connectorId,
+          'oauth_tokens',
+          {
+            accessToken: data.access_token,
+            refreshToken: data.refresh_token ?? refreshToken,
+            tokenType: data.token_type ?? 'Bearer',
+            clientId,
+            ...(clientSecret ? { clientSecret } : {}),
+          },
+          expiresAt
+        );
+
+        return data.access_token;
+      } catch {
+        await services.connectorRepo.setHealth(connectorId, 'auth_failed', 'Token refresh failed — re-authenticate via admin');
+        return null;
+      }
+    };
+  }
+
   private makeAdapter(definition: ConnectorDefinition): ConnectorAdapter {
     if (definition.type === 'http') {
+      // Only wire tokenRefresher for OAuth connectors (oauth field present = oauth_url mode).
+      // api_header / none connectors get undefined so the existing 401 path is unchanged.
+      const tokenRefresher = definition.config.oauth !== undefined && this.services
+        ? this._makeTokenRefresher(definition.id, definition.config.url, definition.name)
+        : undefined;
+
       return new HttpConnectorAdapter({
         id: definition.id,
         name: definition.name,
         url: definition.config.url,
         authToken: definition.config.authToken,
         authScheme: definition.config.authScheme,
-        customHeaders: definition.config.customHeaders
+        customHeaders: definition.config.customHeaders,
+        tokenRefresher,
       });
     }
 

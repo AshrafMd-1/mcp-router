@@ -13,6 +13,7 @@ export enum ErrorCode {
   Timeout = -32012,
   Unavailable = -32013,
   AuthRequired = -32014,
+  ConnectorAuthExpired = -32015,
 }
 
 export interface MappedMcpError {
@@ -21,8 +22,11 @@ export interface MappedMcpError {
   data?: {
     authRequired?: boolean;
     connectorId?: string;
+    connectorName?: string;
     resourceMetadataUrl?: string;
     scope?: string;
+    reason?: string;
+    reauthUrl?: string;
   };
 }
 

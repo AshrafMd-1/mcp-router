@@ -549,7 +549,9 @@ export async function registerAdminRoutes(app: FastifyInstance, ctx: AppContext)
       {
         accessToken: tokenPayload.access_token,
         refreshToken: tokenPayload.refresh_token,
-        tokenType: normalizeAuthScheme(tokenPayload.token_type)
+        tokenType: normalizeAuthScheme(tokenPayload.token_type),
+        clientId: flow.clientId,
+        ...(flow.clientSecret ? { clientSecret: flow.clientSecret } : {})
       },
       expiresAt
     );

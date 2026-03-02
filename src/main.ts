@@ -51,12 +51,18 @@ function toRuntimeConnector(
   if (entity.transport === 'http') {
     const url = entity.configJson.url;
     if (typeof url !== 'string') return null;
+    // Include oauth field for oauth_url mode connectors so ConnectorManager
+    // wires the tokenRefresher for transparent token refresh.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const oauthMarker = entity.mode === 'oauth_url'
+      ? { oauth: (entity.configJson.oauth && typeof entity.configJson.oauth === 'object' ? entity.configJson.oauth : {}) as any }
+      : {};
     return {
       id: entity.id,
       name: entity.name,
       type: 'http',
       enabled: entity.enabled,
-      config: { url, ...(authToken ? { authToken } : {}), ...(authToken ? { authScheme } : {}) }
+      config: { url, ...(authToken ? { authToken } : {}), ...(authToken ? { authScheme } : {}), ...oauthMarker }
     };
   }
 
@@ -91,12 +97,15 @@ async function main() {
     await db.migrate();
   }
 
+  const connectorRepo = new ConnectorsRepository(db);
+  const connectorCredentials = new ConnectorCredentialsRepository(db, encryption);
+
   const services: AppContext['services'] = {
-    connectors: new ConnectorManager(),
+    connectors: new ConnectorManager({ connectorRepo, connectorCredentials }),
     clients: new ClientsRepository(db),
-    connectorRepo: new ConnectorsRepository(db),
+    connectorRepo,
     clientPolicies: new ClientPoliciesRepository(db),
-    connectorCredentials: new ConnectorCredentialsRepository(db, encryption),
+    connectorCredentials,
     toolCache: new ToolCacheRepository(db),
     tokens: new TokenService(db),
     adminSessions: new AdminSessionsRepository(db),

@@ -11,6 +11,7 @@ export interface HttpAdapterConfig {
   authToken?: string;
   authScheme?: string;
   customHeaders?: Record<string, string>;
+  tokenRefresher?: (connectorId: string) => Promise<string | null>;
 }
 
 export class HttpConnectorAdapter implements ConnectorAdapter {
@@ -24,6 +25,8 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
   private serverInfo: { name: string; version?: string } = { name: 'unknown' };
   private authState: ConnectorAuthState = { status: 'none' };
   private hasCompletedAuthFlow = false;
+  private refreshLock: Promise<string | null> | null = null;
+  private authFailed = false;
 
   private capabilities: ConnectorCapabilities = {
     tools: [],
@@ -43,6 +46,13 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
    */
   setProtocolVersion(version: string): void {
     this.protocolVersion = version;
+  }
+
+  /**
+   * Update in-memory auth token (called after successful token refresh)
+   */
+  updateAuthToken(token: string): void {
+    this.config.authToken = token;
   }
 
   /**
@@ -182,6 +192,20 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
    * Follows SDK pattern from typescript-sdk/packages/client/src/streamableHttp.ts:493-523
    */
   private async sendRequest(method: string, params: unknown, timeout = 30000): Promise<unknown> {
+    // Guard: if this connector's refresh token is known-expired, reject immediately
+    if (this.authFailed) {
+      throw new McpError(
+        ErrorCode.ConnectorAuthExpired,
+        'CONNECTOR_AUTH_EXPIRED',
+        {
+          connectorId: this.id,
+          connectorName: this.name,
+          reason: 'refresh_token_expired',
+          reauthUrl: `/admin/connectors/${this.id}/oauth/start`,
+        }
+      );
+    }
+
     const id = Math.floor(Math.random() * 1000000);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -194,9 +218,31 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
         signal: controller.signal
       });
 
-      // Handle 401 Unauthorized - trigger OAuth flow
+      // Handle 401 Unauthorized
       if (response.status === 401) {
-        // Prevent infinite auth loops
+        // Attempt transparent token refresh (only if a refresher is wired up)
+        if (this.config.tokenRefresher) {
+          const newToken = await this._doTokenRefresh();
+          if (newToken) {
+            // Update in-memory token and retry once
+            this.config.authToken = newToken;
+            return this._retryRequest(method, params, timeout);
+          }
+          // Refresh failed — connector is now permanently auth_failed until re-auth
+          this.authFailed = true;
+          throw new McpError(
+            ErrorCode.ConnectorAuthExpired,
+            'CONNECTOR_AUTH_EXPIRED',
+            {
+              connectorId: this.id,
+              connectorName: this.name,
+              reason: 'refresh_token_expired',
+              reauthUrl: `/admin/connectors/${this.id}/oauth/start`,
+            }
+          );
+        }
+
+        // No refresher (non-OAuth connector or OAuth not yet configured)
         if (this.hasCompletedAuthFlow) {
           throw new McpError(
             ErrorCode.Unauthorized,
@@ -215,7 +261,6 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
           error: authError,
         };
 
-        // Return structured error with auth_required flag
         throw new McpError(
           ErrorCode.Unauthorized,
           'Authentication required for upstream MCP server',
@@ -317,6 +362,75 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
     }
 
     throw new Error('SSE response did not include matching JSON-RPC result');
+  }
+
+  /**
+   * Acquire or wait for an in-flight token refresh.
+   * Concurrent callers all await the same Promise so exactly one
+   * refresh grant is posted to the auth server.
+   */
+  private async _doTokenRefresh(): Promise<string | null> {
+    if (!this.config.tokenRefresher) return null;
+    if (this.refreshLock) return this.refreshLock;
+    this.refreshLock = this.config.tokenRefresher(this.id).finally(() => {
+      this.refreshLock = null;
+    });
+    return this.refreshLock;
+  }
+
+  /**
+   * One-shot retry after a successful token refresh.
+   * On a second 401 this surfaces a hard error — no recursive refresh.
+   */
+  private async _retryRequest(method: string, params: unknown, timeout: number): Promise<unknown> {
+    const id = Math.floor(Math.random() * 1000000);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const response = await fetch(this.config.url, {
+        method: 'POST',
+        headers: this._commonHeaders(),
+        body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+        signal: controller.signal
+      });
+
+      if (response.status === 401) {
+        throw new McpError(
+          ErrorCode.Unauthorized,
+          'Server returned 401 after token refresh',
+          { authRequired: true, connectorId: this.id }
+        );
+      }
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new McpError(
+          ErrorCode.Unavailable,
+          `Upstream HTTP ${response.status}: ${text.slice(0, 300)}`
+        );
+      }
+
+      this.hasCompletedAuthFlow = false;
+
+      const contentType = response.headers.get('content-type') ?? '';
+      const payload = contentType.includes('text/event-stream')
+        ? await this.consumeSseResponse(response, id)
+        : ((await response.json()) as import('../mcp/protocol.js').JsonRpcResponse<unknown>);
+
+      if ('error' in payload) {
+        throw new Error(payload.error.message);
+      }
+
+      const nextSession = response.headers.get('Mcp-Session-Id');
+      if (nextSession) {
+        this.sessionId = nextSession;
+      }
+
+      return payload.result;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

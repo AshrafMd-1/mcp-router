@@ -10,7 +10,7 @@ export interface ConnectorEntity {
   transport: ConnectorTransport;
   enabled: boolean;
   configJson: Record<string, unknown>;
-  healthStatus: 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
+  healthStatus: 'healthy' | 'degraded' | 'unhealthy' | 'unknown' | 'auth_failed';
   healthError: string | null;
   lastHealthAt: string | null;
   createdAt: string;
@@ -23,7 +23,7 @@ interface Row {
   transport: ConnectorTransport;
   enabled: boolean;
   config_json: Record<string, unknown>;
-  health_status: 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
+  health_status: 'healthy' | 'degraded' | 'unhealthy' | 'unknown' | 'auth_failed';
   health_error: string | null;
   last_health_at: string | null;
   created_at: string;
@@ -125,7 +125,7 @@ export class ConnectorsRepository {
     return rows.rows[0] ? map(rows.rows[0]) : null;
   }
 
-  async setHealth(id: string, healthStatus: ConnectorEntity['healthStatus'], healthError: string | null): Promise<void> {
+  async setHealth(id: string, healthStatus: 'healthy' | 'degraded' | 'unhealthy' | 'unknown' | 'auth_failed', healthError: string | null): Promise<void> {
     await this.db.query(
       `UPDATE connectors SET health_status = $2, health_error = $3, last_health_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [id, healthStatus, healthError]

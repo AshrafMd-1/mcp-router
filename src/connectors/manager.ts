@@ -228,7 +228,7 @@ export class ConnectorManager {
         });
 
         if (!res.ok) {
-          await services.connectorRepo.setHealth(connectorId, 'auth_failed', 'Refresh token expired — re-authenticate via admin');
+          await services.connectorRepo.setHealth(connectorId, 'auth_failed', 'Refresh token expired - re-authenticate via admin');
           return null;
         }
 
@@ -260,7 +260,7 @@ export class ConnectorManager {
 
         return data.access_token;
       } catch {
-        await services.connectorRepo.setHealth(connectorId, 'auth_failed', 'Token refresh failed — re-authenticate via admin');
+        await services.connectorRepo.setHealth(connectorId, 'auth_failed', 'Token refresh failed - re-authenticate via admin');
         return null;
       }
     };

@@ -228,7 +228,7 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
             this.config.authToken = newToken;
             return this._retryRequest(method, params, timeout);
           }
-          // Refresh failed — connector is now permanently auth_failed until re-auth
+          // Refresh failed - connector is now permanently auth_failed until re-auth
           this.authFailed = true;
           throw new McpError(
             ErrorCode.ConnectorAuthExpired,
@@ -380,7 +380,7 @@ export class HttpConnectorAdapter implements ConnectorAdapter {
 
   /**
    * One-shot retry after a successful token refresh.
-   * On a second 401 this surfaces a hard error — no recursive refresh.
+   * On a second 401 this surfaces a hard error - no recursive refresh.
    */
   private async _retryRequest(method: string, params: unknown, timeout: number): Promise<unknown> {
     const id = Math.floor(Math.random() * 1000000);

@@ -1,4 +1,4 @@
-# MCP Gateway
+# MCP Gateway [alpha]
 
 A self-hosted gateway that multiplexes multiple upstream MCP servers into a single endpoint. AI clients (Claude, Cursor, etc.) connect once and get access to whichever tools the admin has granted them.
 

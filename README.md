@@ -7,12 +7,12 @@ AI Client (Claude/Cursor)
         │  Bearer token
         ▼
   ┌─────────────┐       allowlist policy
-  │ MCP Gateway │──────────────────────────┐
-  └─────────────┘                          │
-     │        │        │                   │
-     ▼        ▼        ▼                   ▼
- GitHub    Figma    local CLI          tool catalog
- (OAuth)  (OAuth)  (STDIO)            (per client)
+  │ MCP Gateway │──────────────────────────────┐
+  └─────────────┘                              │
+     │         │          │                    │
+     ▼         ▼          ▼                    ▼
+   Linear   Granola    local CLI          tool catalog
+   (OAuth)  (OAuth)    (STDIO)            (per client)
 ```
 
 ## Features

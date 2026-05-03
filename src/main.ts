@@ -136,6 +136,7 @@ async function main() {
 
   const address = await app.listen({ host: config.HOST, port: config.PORT });
   console.log(`MCP gateway listening at ${address}`);
+  console.log(`Admin UI: ${address.replace('127.0.0.1', 'localhost')}/admin/`);
 
   const shutdown = async () => {
     console.log('Shutting down gateway');
